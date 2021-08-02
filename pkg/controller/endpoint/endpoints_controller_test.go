@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/watch"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
@@ -250,6 +251,25 @@ func newFakeController(batchPeriod time.Duration) (*fake.Clientset, *endpointCon
 	}
 }
 
+func newFakeInformerController(batchPeriod time.Duration) (*fake.Clientset, informers.SharedInformerFactory, *endpointController) {
+	client := fake.NewSimpleClientset()
+	informerFactory := informers.NewSharedInformerFactory(client, controllerpkg.NoResyncPeriodFunc())
+
+	eController := NewEndpointController(
+		informerFactory.Core().V1().Pods(),
+		informerFactory.Core().V1().Services(),
+		informerFactory.Core().V1().Endpoints(),
+		client,
+		batchPeriod)
+
+	return client, informerFactory, &endpointController{
+		eController,
+		informerFactory.Core().V1().Pods().Informer().GetStore(),
+		informerFactory.Core().V1().Services().Informer().GetStore(),
+		informerFactory.Core().V1().Endpoints().Informer().GetStore(),
+	}
+}
+
 func TestSyncEndpointsItemsPreserveNoSelector(t *testing.T) {
 	ns := metav1.NamespaceDefault
 	testServer, endpointsHandler := makeTestServer(t, ns)
@@ -361,6 +381,67 @@ func TestCheckLeftoverEndpoints(t *testing.T) {
 	got, _ := endpoints.queue.Get()
 	if e, a := ns+"/foo", got; e != a {
 		t.Errorf("Expected %v, got %v", e, a)
+	}
+}
+
+func TestCheckLeftoverEndpointsDeletedUnexpectedly(t *testing.T) {
+	watch.DefaultChanSize = 1000
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	ns := metav1.NamespaceDefault
+	client, informerFactory, endpoints := newFakeInformerController(0 * time.Second)
+	wg := wait.Group{}
+	for i := 0; i < 1000; i++ {
+		i := i
+		wg.Start(func() {
+			name := fmt.Sprintf("autogen-stage1-%d", i)
+			client.CoreV1().Services(ns).Create(context.TODO(), &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: ns,
+				},
+			}, metav1.CreateOptions{})
+			client.CoreV1().Endpoints(ns).Create(context.TODO(), &v1.Endpoints{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: ns,
+				},
+			}, metav1.CreateOptions{})
+		})
+	}
+	wg.Wait()
+	go informerFactory.Start(stopCh)
+	go endpoints.Run(10, stopCh)
+	for i := 0; i < 1000; i++ {
+		i := i
+		wg.Start(func() {
+			name := fmt.Sprintf("autogen-stage2-%d", i)
+			client.CoreV1().Services(ns).Create(context.TODO(), &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: ns,
+				},
+			}, metav1.CreateOptions{})
+			client.CoreV1().Endpoints(ns).Create(context.TODO(), &v1.Endpoints{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: ns,
+				},
+			}, metav1.CreateOptions{})
+		})
+	}
+	wg.Wait()
+	wait.PollUntil(100*time.Millisecond, func() (done bool, err error) {
+		if endpoints.queue.Len() != 0 {
+			return false, nil
+		}
+		return true, nil
+	}, stopCh)
+
+	allSvc, _ := client.CoreV1().Services(ns).List(context.TODO(), metav1.ListOptions{})
+	allEnd, _ := client.CoreV1().Endpoints(ns).List(context.TODO(), metav1.ListOptions{})
+	if len(allSvc.Items) != len(allEnd.Items) {
+		t.Errorf("svc count: %d, endpoint count: %d", len(allSvc.Items), len(allEnd.Items))
 	}
 }
 
